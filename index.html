@@ -1,0 +1,301 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>GPS Batch Capture</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 16px; }
+    h2 { margin: 0 0 10px; }
+    .card { background: #f6f6f6; padding: 12px; border-radius: 10px; margin: 10px 0; }
+    input { width: 100%; padding: 12px; font-size: 16px; border-radius: 10px; border: 1px solid #ddd; }
+    button { width: 100%; padding: 14px; margin: 3px 0; font-size: 18px; border-radius: 12px; border: 0; height: 4em; }
+    .grid { display: grid; gap: 10px; grid-template-columns: 1fr 1fr; }
+    .status { margin-top: 8px; }
+    pre { background: #111; color: #eee; padding: 12px; border-radius: 10px; overflow:auto; font-size: 12px; }
+    .muted { color: #555; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <h2>GPS Batch Capture</h2>
+
+  <div class="card">
+    <label for="username"><b>User name</b> <span class="muted">(optional)</span></label>
+    <input id="username" placeholder="e.g. Alex (optional)" autocomplete="name" />
+    <div class="status" id="status"></div>
+    <div class="status" id="gpsStatus"></div>
+    <div class="status" id="queueStatus"></div>
+  </div>
+
+  <div class="grid">
+    <button onclick="tapCategory('BENCH')">BENCH</button>
+    <button onclick="tapCategory('BIN')">BIN</button>
+    <button onclick="tapCategory('TREE')">TREE</button>
+    <button onclick="tapCategory('TABLE')">TABLE</button>
+  </div>
+
+  <div class="card">
+    <b>Debug (last batch to console)</b>
+    <pre id="debug">{}</pre>
+  </div>
+
+<script>
+  // ===== CONFIG =====
+  const SAMPLE_GAP_MS = 2000;         // 2 seconds between points
+  const ACCURACY_LIMIT_M = 100;       // require <= 100m accuracy
+  const HIGH_ACCURACY = true;
+
+  // Bigger timeouts to reduce "timeout exceeded"
+  const GEO_TIMEOUT_MS = 30000;       // 30s per request
+  const MAX_AGE_MS = 5000;            // allow up to 5s cached to reduce timeouts
+
+  // Warm-up / retry
+  const WARMUP_RETRY_MS = 2500;       // retry interval until we have good fix
+  const WARMUP_BADFIX_MAX_MS = 120000;// after 2 min, still keep trying but show stronger message
+
+  // Batching: flush after 10s of inactivity since last successful capture
+  const BATCH_WINDOW_MS = 10000;
+
+  // ===== UI =====
+  const statusEl = document.getElementById("status");
+  const gpsStatusEl = document.getElementById("gpsStatus");
+  const queueStatusEl = document.getElementById("queueStatus");
+  const debugEl = document.getElementById("debug");
+  const usernameEl = document.getElementById("username");
+
+  function setStatus(msg) { statusEl.textContent = msg; }
+  function setGpsStatus(msg) { gpsStatusEl.textContent = msg; }
+  function setQueueStatus(msg) { queueStatusEl.textContent = msg; }
+  function setDebug(obj) { debugEl.textContent = JSON.stringify(obj, null, 2); }
+
+  // ===== QUEUE / BATCH STATE =====
+  const queue = [];
+  let batchTimer = null;
+  let activeCaptures = 0;
+
+  function updateQueueUI() {
+    setQueueStatus(`Queued items: ${queue.length} | Active captures: ${activeCaptures}`);
+  }
+
+  function scheduleBatchSend() {
+    if (batchTimer) clearTimeout(batchTimer);
+    batchTimer = setTimeout(() => flushBatch("timer"), BATCH_WINDOW_MS);
+  }
+
+  // ===== GEOLOCATION =====
+  function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+  function getPositionOnce() {
+    return new Promise((resolve, reject) => {
+      if (!navigator.geolocation) {
+        reject(new Error("Geolocation not supported."));
+        return;
+      }
+      navigator.geolocation.getCurrentPosition(
+        resolve,
+        reject,
+        {
+          enableHighAccuracy: HIGH_ACCURACY,
+          timeout: GEO_TIMEOUT_MS,
+          maximumAge: MAX_AGE_MS
+        }
+      );
+    });
+  }
+
+  // Keep a "best recent fix" from warm-up so button taps can be faster / less timeout-y
+  let bestFix = null; // { pos, receivedAtMs }
+  function isGoodFix(pos) {
+    return pos && pos.coords && typeof pos.coords.accuracy === "number" && pos.coords.accuracy <= ACCURACY_LIMIT_M;
+  }
+
+  async function warmupLoop() {
+    const start = Date.now();
+    setGpsStatus("GPS warm-up: requesting location… (needs HTTPS + permission)");
+    while (true) {
+      try {
+        const pos = await getPositionOnce();
+        bestFix = { pos, receivedAtMs: Date.now() };
+
+        const acc = Math.round(pos.coords.accuracy);
+        if (acc <= ACCURACY_LIMIT_M) {
+          setGpsStatus(`GPS warm-up: ✅ good fix (${acc}m). Ready.`);
+          return; // stop warmup loop once good fix obtained
+        } else {
+          const elapsed = Date.now() - start;
+          const msg = elapsed > WARMUP_BADFIX_MAX_MS
+            ? `GPS warm-up: fix still weak (${acc}m). Try moving outdoors / enabling GPS. Retrying…`
+            : `GPS warm-up: got fix (${acc}m), need ≤ ${ACCURACY_LIMIT_M}m. Retrying…`;
+          setGpsStatus(msg);
+        }
+      } catch (err) {
+        // Common: timeout or permission issues
+        const code = err && typeof err.code === "number" ? err.code : null;
+        if (code === 1) { // PERMISSION_DENIED
+          setGpsStatus("GPS warm-up: ❌ permission denied. Enable location access in browser settings.");
+          return; // cannot retry meaningfully
+        }
+        setGpsStatus(`GPS warm-up: ${err.message || err} (retrying…)`);
+      }
+
+      await sleep(WARMUP_RETRY_MS);
+    }
+  }
+
+  // Use warm-up fix if it is recent and good, else request fresh.
+  async function getGoodPositionOrThrow() {
+    const now = Date.now();
+    if (bestFix && isGoodFix(bestFix.pos) && (now - bestFix.receivedAtMs) < 15000) {
+      return bestFix.pos;
+    }
+
+    const pos = await getPositionOnce();
+    bestFix = { pos, receivedAtMs: Date.now() };
+
+    const acc = pos.coords.accuracy;
+    if (acc > ACCURACY_LIMIT_M) {
+      throw new Error(`Accuracy too low: ${Math.round(acc)}m (> ${ACCURACY_LIMIT_M}m)`);
+    }
+    return pos;
+  }
+
+  // ===== GREAT-CIRCLE / BEARING =====
+  function haversineMeters(lat1, lon1, lat2, lon2) {
+    const R = 6371000;
+    const toRad = d => d * Math.PI / 180;
+    const φ1 = toRad(lat1), φ2 = toRad(lat2);
+    const Δφ = toRad(lat2 - lat1);
+    const Δλ = toRad(lon2 - lon1);
+    const a = Math.sin(Δφ/2)**2 + Math.cos(φ1)*Math.cos(φ2)*Math.sin(Δλ/2)**2;
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+    return R * c;
+  }
+
+  function bearingDegrees(lat1, lon1, lat2, lon2) {
+    const toRad = d => d * Math.PI / 180;
+    const toDeg = r => r * 180 / Math.PI;
+    const φ1 = toRad(lat1), φ2 = toRad(lat2);
+    const Δλ = toRad(lon2 - lon1);
+    const y = Math.sin(Δλ) * Math.cos(φ2);
+    const x = Math.cos(φ1)*Math.sin(φ2) - Math.sin(φ1)*Math.cos(φ2)*Math.cos(Δλ);
+    const θ = Math.atan2(y, x);
+    return (toDeg(θ) + 360) % 360;
+  }
+
+  // ===== MAIN: ON TAP =====
+  async function tapCategory(category) {
+    const user = (usernameEl.value || "").trim(); // optional
+
+    activeCaptures++;
+    updateQueueUI();
+    setStatus(`Capturing ${category}: point 1…`);
+
+    try {
+      // point 1 (use warm-up fix if good/recent)
+      const p1 = await getGoodPositionOrThrow();
+
+      setStatus(`Capturing ${category}: point 2 in 2s…`);
+      await sleep(SAMPLE_GAP_MS);
+
+      // point 2
+      const p2 = await getGoodPositionOrThrow();
+
+      const c1 = p1.coords, c2 = p2.coords;
+      const t1 = p1.timestamp, t2 = p2.timestamp;
+      const dtSec = Math.max(0.001, (t2 - t1) / 1000);
+
+      const distM = haversineMeters(c1.latitude, c1.longitude, c2.latitude, c2.longitude);
+      const speedKmh = (distM / dtSec) * 3.6;
+
+      const directionDeg =
+        (typeof c2.heading === "number" && !Number.isNaN(c2.heading) && c2.heading >= 0)
+          ? c2.heading
+          : bearingDegrees(c1.latitude, c1.longitude, c2.latitude, c2.longitude);
+
+      const item = {
+        category,
+        capturedAt: new Date().toISOString(),
+        ...(user ? { user } : {}),  // only include if provided
+        point1: {
+          lat: c1.latitude, lon: c1.longitude,
+          accuracyM: c1.accuracy, timestampMs: t1
+        },
+        point2: {
+          lat: c2.latitude, lon: c2.longitude,
+          accuracyM: c2.accuracy, timestampMs: t2
+        },
+        derived: {
+          dtSec,
+          distanceM: distM,
+          speedKmh,
+          directionDeg
+        }
+      };
+
+      queue.push(item);
+      setStatus(`✅ Captured ${category}. Queued.`);
+      updateQueueUI();
+      scheduleBatchSend();
+
+    } catch (err) {
+      console.error(err);
+      setStatus(`❌ ${category}: ${err.message || err}`);
+      // Keep warming up in case we lost fix / moved inside
+      warmupLoop().catch(() => {});
+    } finally {
+      activeCaptures--;
+      updateQueueUI();
+    }
+  }
+
+  // ===== FLUSH BATCH =====
+  function flushBatch(reason) {
+    if (batchTimer) { clearTimeout(batchTimer); batchTimer = null; }
+    if (queue.length === 0) { setStatus("Nothing to send."); return; }
+
+    const batch = {
+      sentAt: new Date().toISOString(),
+      reason,
+      count: queue.length,
+      items: queue.splice(0, queue.length)
+    };
+
+    console.log("BATCH_PAYLOAD", batch);
+    // Send to backend (save.php)
+    fetch("save.php", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(batch)
+    })
+    .then(async (res) => {
+        const text = await res.text();
+        let json = {};
+        try { json = JSON.parse(text); } catch {}
+        if (!res.ok) throw new Error(`HTTP ${res.status}: ${text}`);
+        console.log("Backend response:", json);
+        setDebug({ batch, backendResponse: json });
+        setStatus(`✅ Sent batch (${batch.count}). Inserted: ${json.inserted ?? "?"}`);
+    })
+    .catch((err) => {
+        console.error(err);
+        setDebug({ batch, error: String(err) });
+        setStatus(`❌ Send failed: ${err.message || err}`);
+    });
+
+    setDebug(batch);
+    setStatus(`📦 Batch printed to console (${batch.count} items).`);
+    updateQueueUI();
+  }
+
+  // ===== STARTUP =====
+  updateQueueUI();
+  setStatus("Loading… requesting GPS immediately.");
+  // Start warm-up ASAP
+  warmupLoop().catch(err => {
+    console.error(err);
+    setGpsStatus(`GPS warm-up failed: ${err.message || err}`);
+  });
+</script>
+<a href="latest.php">Data</a>
+</body>
+</html>
