@@ -42,13 +42,13 @@
 <script>
   // ===== CONFIG =====
   const SAMPLE_GAP_MS = 2000;         // 2 seconds between points
-  const ACCURACY_LIMIT_M = 100;       // require <= 100m accuracy
+  const ACCURACY_LIMIT_M = 40;       // require <= 40m accuracy
   const HIGH_ACCURACY = true;
 
   // Bigger timeouts to reduce "timeout exceeded"
-  const GEO_TIMEOUT_MS = 5000;       // 5s per request
+  const GEO_TIMEOUT_MS = 15000;       // 15s per request
   const BROWSER_MAX_AGE_MS = 900;    // allow up to 0.9s browser-level cached to reduce timeouts
-  const APP_MAX_AGE_MS = 1000;       // allow up to 1s app-level cached to reduce timeouts
+  const POSITION_HISTORY_MS = 5000;   // Keep positions from last 5 seconds
 
   // Warm-up / retry
   const WARMUP_RETRY_MS = 2500;       // retry interval until we have good fix
@@ -87,20 +87,51 @@
   // ===== GEOLOCATION =====
   function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-  // Continuous GPS watching - updates position as it becomes available
-  let watchId = null;
-  let watchedPosition = null; // GeolocationPosition - continuously updated by watchPosition
+  // Dual polling: high accuracy and approximate (like Google Maps)
+  let pollIntervalHighAccuracy = null;
+  let pollIntervalApproximate = null;
+  let positionHistory = []; // Array of { pos, receivedAtMs } - positions from both pollers
   let lastPositionTimestamp = null; // Track when we last used a position to ensure freshness
+  const POLL_INTERVAL_MS = 1000; // Poll every second
 
   function isGoodFix(pos) {
     return pos && pos.coords && typeof pos.coords.accuracy === "number" && pos.coords.accuracy <= ACCURACY_LIMIT_M;
   }
 
-  function stopWatchingPosition() {
-    if (watchId !== null) {
-      navigator.geolocation.clearWatch(watchId);
-      watchId = null;
+  // Clean up old positions from history (older than POSITION_HISTORY_MS)
+  function cleanupPositionHistory() {
+    const now = Date.now();
+    positionHistory = positionHistory.filter(item => (now - item.receivedAtMs) < POSITION_HISTORY_MS);
+  }
+
+  // Get the most accurate position from the last 5 seconds
+  function getBestRecentPosition() {
+    cleanupPositionHistory();
+    if (positionHistory.length === 0) return null;
+    
+    // Sort by accuracy (lower is better), then by recency
+    const sorted = [...positionHistory].sort((a, b) => {
+      const accDiff = (a.pos.coords.accuracy || Infinity) - (b.pos.coords.accuracy || Infinity);
+      if (Math.abs(accDiff) < 1) {
+        // If accuracy is similar, prefer more recent
+        return b.receivedAtMs - a.receivedAtMs;
+      }
+      return accDiff;
+    });
+    
+    return sorted[0].pos;
+  }
+
+  function stopPollingPosition() {
+    if (pollIntervalHighAccuracy !== null) {
+      clearInterval(pollIntervalHighAccuracy);
+      pollIntervalHighAccuracy = null;
     }
+    if (pollIntervalApproximate !== null) {
+      clearInterval(pollIntervalApproximate);
+      pollIntervalApproximate = null;
+    }
+    positionHistory = [];
   }
 
   // Get a fresh position from the watch (waits for a new position if needed)
@@ -116,12 +147,15 @@
 
       // Wait for a position that's newer than the last one we used
       const checkInterval = setInterval(() => {
-        if (watchedPosition && isGoodFix(watchedPosition)) {
-          const positionTime = watchedPosition.timestamp;
+        cleanupPositionHistory();
+        const bestPos = getBestRecentPosition();
+        
+        if (bestPos) {
+          const positionTime = bestPos.timestamp;
           
           if (!lastUsedTimestamp || positionTime > lastUsedTimestamp) {
             clearInterval(checkInterval);
-            resolve(watchedPosition);
+            resolve(bestPos);
             return;
           }
         }
@@ -129,11 +163,11 @@
         // Timeout check
         if (Date.now() - startTime > GEO_TIMEOUT_MS) {
           clearInterval(checkInterval);
-          if (watchedPosition && isGoodFix(watchedPosition)) {
-            // Use whatever we have if timeout, but still check it's different
-            const positionTime = watchedPosition.timestamp;
+          const bestPos = getBestRecentPosition();
+          if (bestPos) {
+            const positionTime = bestPos.timestamp;
             if (!lastUsedTimestamp || positionTime > lastUsedTimestamp) {
-              resolve(watchedPosition);
+              resolve(bestPos);
             } else {
               reject(new Error("Timeout waiting for new GPS position"));
             }
@@ -145,37 +179,89 @@
     });
   }
 
-  function startWatchingPosition() {
-    if (!navigator.geolocation) {
-      setGpsStatus("❌ Geolocation not supported.");
-      return;
-    }
-
-    watchId = navigator.geolocation.watchPosition(
+  function pollHighAccuracy() {
+    navigator.geolocation.getCurrentPosition(
       (position) => {
-        // Update watched position if it's accurate enough
-        if (isGoodFix(position)) {
-          watchedPosition = position;
-        } else {
-          // Clear position if accuracy degrades
-          watchedPosition = null;
-        }
+        const acc = Math.round(position.coords.accuracy);
+        const formattedTime = new Date(position.timestamp).toLocaleString();
+        setGpsStatus(`GPS (high): ${acc}m @ ${formattedTime}`);
+        
+        // Add to history
+        positionHistory.push({
+          pos: position,
+          receivedAtMs: Date.now()
+        });
+        cleanupPositionHistory();
       },
       (error) => {
         const code = error && typeof error.code === "number" ? error.code : null;
         if (code === 1) { // PERMISSION_DENIED
           setGpsStatus("GPS: ❌ permission denied. Enable location access in browser settings.");
         } else {
-          setGpsStatus(`GPS: ${error.message || error}`);
+          // Don't show errors for high accuracy - approximate will handle it
         }
-        watchedPosition = null;
       },
       {
-        enableHighAccuracy: HIGH_ACCURACY,
-        maximumAge: 0, // Don't use cached positions - always get fresh
+        enableHighAccuracy: true,
+        maximumAge: 0, // Force fresh position - no caching
         timeout: GEO_TIMEOUT_MS
       }
     );
+  }
+
+  function pollApproximate() {
+    navigator.geolocation.getCurrentPosition(
+      (position) => {
+        const acc = Math.round(position.coords.accuracy);
+        const formattedTime = new Date(position.timestamp).toLocaleString();
+        // Only log if it's significantly different or better than high accuracy
+        const bestRecent = getBestRecentPosition();
+        if (!bestRecent || position.coords.accuracy < bestRecent.coords.accuracy) {
+          setGpsStatus(`GPS (approx): ${acc}m @ ${formattedTime}`);
+        }
+        
+        // Add to history
+        positionHistory.push({
+          pos: position,
+          receivedAtMs: Date.now()
+        });
+        cleanupPositionHistory();
+      },
+      (error) => {
+        const code = error && typeof error.code === "number" ? error.code : null;
+        if (code === 1) { // PERMISSION_DENIED
+          setGpsStatus("GPS: ❌ permission denied. Enable location access in browser settings.");
+        } else {
+          // Approximate can fail silently - high accuracy will handle it
+        }
+      },
+      {
+        enableHighAccuracy: false, // Approximate mode
+        maximumAge: 0, // Force fresh position - no caching
+        timeout: GEO_TIMEOUT_MS
+      }
+    );
+  }
+
+  function startPollingPosition() {
+    if (!navigator.geolocation) {
+      setGpsStatus("❌ Geolocation not supported.");
+      return;
+    }
+
+    // Start polling immediately, then every second
+    pollHighAccuracy();
+    pollApproximate();
+    
+    // High accuracy poller (GPS) - poll every second
+    pollIntervalHighAccuracy = setInterval(() => {
+      pollHighAccuracy();
+    }, POLL_INTERVAL_MS);
+
+    // Approximate poller (network/cell towers) - poll every second
+    pollIntervalApproximate = setInterval(() => {
+      pollApproximate();
+    }, POLL_INTERVAL_MS);
   }
 
   async function warmupLoop() {
@@ -320,14 +406,14 @@
 
   // ===== STARTUP =====
   updateQueueUI();
-  setStatus("Loading... starting GPS watch.");
-  // Start watching position immediately
-  startWatchingPosition();
+  setStatus("Loading... starting GPS polling.");
+  // Start polling position immediately
+  startPollingPosition();
   // Start warm-up to wait for first good fix
-  warmupLoop().catch(err => {
-    console.error(err);
-    setGpsStatus(`GPS warm-up failed: ${err.message || err}`);
-  });
+  //warmupLoop().catch(err => {
+  //  console.error(err);
+  //  setGpsStatus(`GPS warm-up failed: ${err.message || err}`);
+  //});
 </script>
 <a href="latest.php">Data</a>
 </body>
