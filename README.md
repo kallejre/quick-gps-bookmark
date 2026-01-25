@@ -16,3 +16,5 @@ Known bugs todos:
 * when whole webpage won't fit into view, then page becomes scrollable and tapping on button may accidentally scroll page instead
 * offline resiliency need testing
 * support for icons for buttons
+* calculated columns dt, speed, distance, direction are shown 0.0 in data view
+* Locking phone screen loses gps fix, unless user has other gps running at same time
