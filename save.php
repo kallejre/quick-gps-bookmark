@@ -5,6 +5,31 @@ declare(strict_types=1);
 
 header('Content-Type: application/json; charset=utf-8');
 
+// ===== GREAT-CIRCLE / BEARING CALCULATIONS =====
+function haversineMeters(float $lat1, float $lon1, float $lat2, float $lon2): float {
+  $R = 6371000.0; // Earth radius in meters
+  $toRad = fn($d) => $d * M_PI / 180.0;
+  $lat1Rad = $toRad($lat1);
+  $lat2Rad = $toRad($lat2);
+  $deltaLat = $toRad($lat2 - $lat1);
+  $deltaLon = $toRad($lon2 - $lon1);
+  $a = sin($deltaLat / 2) ** 2 + cos($lat1Rad) * cos($lat2Rad) * sin($deltaLon / 2) ** 2;
+  $c = 2 * atan2(sqrt($a), sqrt(1 - $a));
+  return $R * $c;
+}
+
+function bearingDegrees(float $lat1, float $lon1, float $lat2, float $lon2): float {
+  $toRad = fn($d) => $d * M_PI / 180.0;
+  $toDeg = fn($r) => $r * 180.0 / M_PI;
+  $lat1Rad = $toRad($lat1);
+  $lat2Rad = $toRad($lat2);
+  $deltaLon = $toRad($lon2 - $lon1);
+  $y = sin($deltaLon) * cos($lat2Rad);
+  $x = cos($lat1Rad) * sin($lat2Rad) - sin($lat1Rad) * cos($lat2Rad) * cos($deltaLon);
+  $theta = atan2($y, $x);
+  return fmod($toDeg($theta) + 360.0, 360.0);
+}
+
 function respond(int $code, array $data): void {
   http_response_code($code);
   echo json_encode($data, JSON_UNESCAPED_SLASHES);
@@ -115,7 +140,6 @@ try {
 
     $p1 = $item['point1'] ?? null;
     $p2 = $item['point2'] ?? null;
-    $derived = $item['derived'] ?? [];
 
     if ($category === '' || $capturedAt === '' || !is_array($p1) || !is_array($p2)) {
       $errors[] = ['index' => $idx, 'error' => 'Missing category/capturedAt/point1/point2'];
@@ -130,6 +154,34 @@ try {
       continue;
     }
 
+    $p1lat = (float)$p1lat;
+    $p1lon = (float)$p1lon;
+    $p2lat = (float)$p2lat;
+    $p2lon = (float)$p2lon;
+
+    // Get timestamps for calculations
+    $t1 = isset($p1['timestampMs']) && is_numeric($p1['timestampMs']) ? (int)$p1['timestampMs'] : null;
+    $t2 = isset($p2['timestampMs']) && is_numeric($p2['timestampMs']) ? (int)$p2['timestampMs'] : null;
+
+    // Calculate derived values on backend
+    $dtSec = null;
+    $distanceM = null;
+    $speedKmh = null;
+    $directionDeg = null;
+
+    if ($t1 !== null && $t2 !== null && $t2 > $t1) {
+      $dtSec = max(0.001, ($t2 - $t1) / 1000.0);
+      $distanceM = haversineMeters($p1lat, $p1lon, $p2lat, $p2lon);
+      if ($dtSec > 0) {
+        $speedKmh = ($distanceM / $dtSec) * 3.6;
+      }
+      $directionDeg = bearingDegrees($p1lat, $p1lon, $p2lat, $p2lon);
+    } else if ($t1 !== null && $t2 !== null) {
+      // If timestamps are equal or invalid, still calculate distance and direction
+      $distanceM = haversineMeters($p1lat, $p1lon, $p2lat, $p2lon);
+      $directionDeg = bearingDegrees($p1lat, $p1lon, $p2lat, $p2lon);
+    }
+
     $user = isset($item['user']) && trim((string)$item['user']) !== '' ? (string)$item['user'] : null;
 
     $ins->execute([
@@ -141,20 +193,20 @@ try {
       ':user' => $user,
       ':captured_at' => $capturedAt,
 
-      ':p1_lat' => (float)$p1lat,
-      ':p1_lon' => (float)$p1lon,
+      ':p1_lat' => $p1lat,
+      ':p1_lon' => $p1lon,
       ':p1_accuracy_m' => isset($p1['accuracyM']) && is_numeric($p1['accuracyM']) ? (float)$p1['accuracyM'] : null,
-      ':p1_timestamp_ms' => isset($p1['timestampMs']) && is_numeric($p1['timestampMs']) ? (int)$p1['timestampMs'] : null,
+      ':p1_timestamp_ms' => $t1,
 
-      ':p2_lat' => (float)$p2lat,
-      ':p2_lon' => (float)$p2lon,
+      ':p2_lat' => $p2lat,
+      ':p2_lon' => $p2lon,
       ':p2_accuracy_m' => isset($p2['accuracyM']) && is_numeric($p2['accuracyM']) ? (float)$p2['accuracyM'] : null,
-      ':p2_timestamp_ms' => isset($p2['timestampMs']) && is_numeric($p2['timestampMs']) ? (int)$p2['timestampMs'] : null,
+      ':p2_timestamp_ms' => $t2,
 
-      ':dt_sec' => isset($derived['dtSec']) && is_numeric($derived['dtSec']) ? (float)$derived['dtSec'] : null,
-      ':distance_m' => isset($derived['distanceM']) && is_numeric($derived['distanceM']) ? (float)$derived['distanceM'] : null,
-      ':speed_kmh' => isset($derived['speedKmh']) && is_numeric($derived['speedKmh']) ? (float)$derived['speedKmh'] : null,
-      ':direction_deg' => isset($derived['directionDeg']) && is_numeric($derived['directionDeg']) ? (float)$derived['directionDeg'] : null,
+      ':dt_sec' => $dtSec,
+      ':distance_m' => $distanceM,
+      ':speed_kmh' => $speedKmh,
+      ':direction_deg' => $directionDeg,
 
       ':raw_json' => json_encode($item, JSON_UNESCAPED_SLASHES),
     ]);

@@ -159,29 +159,6 @@
     return pos;
   }
 
-  // ===== GREAT-CIRCLE / BEARING =====
-  function haversineMeters(lat1, lon1, lat2, lon2) {
-    const R = 6371000;
-    const toRad = d => d * Math.PI / 180;
-    const φ1 = toRad(lat1), φ2 = toRad(lat2);
-    const Δφ = toRad(lat2 - lat1);
-    const Δλ = toRad(lon2 - lon1);
-    const a = Math.sin(Δφ/2)**2 + Math.cos(φ1)*Math.cos(φ2)*Math.sin(Δλ/2)**2;
-    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
-    return R * c;
-  }
-
-  function bearingDegrees(lat1, lon1, lat2, lon2) {
-    const toRad = d => d * Math.PI / 180;
-    const toDeg = r => r * 180 / Math.PI;
-    const φ1 = toRad(lat1), φ2 = toRad(lat2);
-    const Δλ = toRad(lon2 - lon1);
-    const y = Math.sin(Δλ) * Math.cos(φ2);
-    const x = Math.cos(φ1)*Math.sin(φ2) - Math.sin(φ1)*Math.cos(φ2)*Math.cos(Δλ);
-    const θ = Math.atan2(y, x);
-    return (toDeg(θ) + 360) % 360;
-  }
-
   // ===== MAIN: ON TAP =====
   async function tapCategory(category) {
     const user = (usernameEl.value || "").trim(); // optional
@@ -199,37 +176,21 @@
 
       // point 2
       const p2 = await getGoodPositionOrThrow();
+      const t2 = p2.timestamp;
 
-      const c1 = p1.coords, c2 = p2.coords;
-      const t1 = p1.timestamp, t2 = p2.timestamp;
-      const dtSec = Math.max(0.001, (t2 - t1) / 1000);
-
-      const distM = haversineMeters(c1.latitude, c1.longitude, c2.latitude, c2.longitude);
-      const speedKmh = (distM / dtSec) * 3.6;
-
-      const directionDeg =
-        (typeof c2.heading === "number" && !Number.isNaN(c2.heading) && c2.heading >= 0)
-          ? c2.heading
-          : bearingDegrees(c1.latitude, c1.longitude, c2.latitude, c2.longitude);
-
+      // Send raw points - backend will calculate speed/distance/direction
       const item = {
         category,
         capturedAt: new Date().toISOString(),
         ...(user ? { user } : {}),  // only include if provided
         point1: {
-          lat: c1.latitude, lon: c1.longitude,
-          accuracyM: c1.accuracy, timestampMs: t1
+          lat: p1.coords.latitude, lon: p1.coords.longitude,
+          accuracyM: p1.coords.accuracy, timestampMs: t1
         },
         point2: {
-          lat: c2.latitude, lon: c2.longitude,
-          accuracyM: c2.accuracy, timestampMs: t2
-        },
-        derived: {
-          dtSec,
-          distanceM: distM,
-          speedKmh,
-          directionDeg
-        }
+          lat: p2.coords.latitude, lon: p2.coords.longitude,
+          accuracyM: p2.coords.accuracy, timestampMs: t2
+                }
       };
 
       queue.push(item);
@@ -241,7 +202,7 @@
       console.error(err);
       setStatus(`❌ ${category}: ${err.message || err}`);
       // Keep warming up in case we lost fix / moved inside
-      warmupLoop().catch(() => {});
+      warmupLoop().catch((e) => {console.error(e); });
     } finally {
       activeCaptures--;
       updateQueueUI();
