@@ -11,3 +11,8 @@ SQLite table and provides a simple HTML endpoint to view the latest entries. Des
 field use, and easy inspection without external dependencies.
 
 PS. I don't think it's really offline-tolerant, looks like if upload fails, collected data might get deleted.
+
+Known bugs todos:
+* when whole webpage won't fit into view, then page becomes scrollable and tapping on button may accidentally scroll page instead
+* offline resiliency need testing
+* support for icons for buttons
