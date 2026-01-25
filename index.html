@@ -46,12 +46,14 @@
   const HIGH_ACCURACY = true;
 
   // Bigger timeouts to reduce "timeout exceeded"
-  const GEO_TIMEOUT_MS = 30000;       // 30s per request
-  const MAX_AGE_MS = 5000;            // allow up to 5s cached to reduce timeouts
+  const GEO_TIMEOUT_MS = 5000;       // 5s per request
+  const BROWSER_MAX_AGE_MS = 900;    // allow up to 0.9s browser-level cached to reduce timeouts
+  const APP_MAX_AGE_MS = 1000;       // allow up to 1s app-level cached to reduce timeouts
 
   // Warm-up / retry
   const WARMUP_RETRY_MS = 2500;       // retry interval until we have good fix
   const WARMUP_BADFIX_MAX_MS = 120000;// after 2 min, still keep trying but show stronger message
+  const SAMPLE_RETRY_MS = 250; // If initial sample fails, retry after 250ms
 
   // Batching: flush after 10s of inactivity since last successful capture
   const BATCH_WINDOW_MS = 10000;
@@ -85,37 +87,105 @@
   // ===== GEOLOCATION =====
   function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+  // Continuous GPS watching - updates position as it becomes available
+  let watchId = null;
+  let watchedPosition = null; // GeolocationPosition - continuously updated by watchPosition
+  let lastPositionTimestamp = null; // Track when we last used a position to ensure freshness
+
+  function isGoodFix(pos) {
+    return pos && pos.coords && typeof pos.coords.accuracy === "number" && pos.coords.accuracy <= ACCURACY_LIMIT_M;
+  }
+
+  function stopWatchingPosition() {
+    if (watchId !== null) {
+      navigator.geolocation.clearWatch(watchId);
+      watchId = null;
+    }
+  }
+
+  // Get a fresh position from the watch (waits for a new position if needed)
   function getPositionOnce() {
     return new Promise((resolve, reject) => {
       if (!navigator.geolocation) {
         reject(new Error("Geolocation not supported."));
         return;
       }
-      navigator.geolocation.getCurrentPosition(
-        resolve,
-        reject,
-        {
-          enableHighAccuracy: HIGH_ACCURACY,
-          timeout: GEO_TIMEOUT_MS,
-          maximumAge: MAX_AGE_MS
+
+      const startTime = Date.now();
+      const lastUsedTimestamp = lastPositionTimestamp; // Capture current value
+
+      // Wait for a position that's newer than the last one we used
+      const checkInterval = setInterval(() => {
+        if (watchedPosition && isGoodFix(watchedPosition)) {
+          const positionTime = watchedPosition.timestamp;
+          
+          if (!lastUsedTimestamp || positionTime > lastUsedTimestamp) {
+            clearInterval(checkInterval);
+            resolve(watchedPosition);
+            return;
+          }
         }
-      );
+        
+        // Timeout check
+        if (Date.now() - startTime > GEO_TIMEOUT_MS) {
+          clearInterval(checkInterval);
+          if (watchedPosition && isGoodFix(watchedPosition)) {
+            // Use whatever we have if timeout, but still check it's different
+            const positionTime = watchedPosition.timestamp;
+            if (!lastUsedTimestamp || positionTime > lastUsedTimestamp) {
+              resolve(watchedPosition);
+            } else {
+              reject(new Error("Timeout waiting for new GPS position"));
+            }
+          } else {
+            reject(new Error("Timeout waiting for GPS position"));
+          }
+        }
+      }, 100); // Check every 100ms
     });
   }
 
-  // Keep a "best recent fix" from warm-up so button taps can be faster / less timeout-y
-  let bestFix = null; // { pos, receivedAtMs }
-  function isGoodFix(pos) {
-    return pos && pos.coords && typeof pos.coords.accuracy === "number" && pos.coords.accuracy <= ACCURACY_LIMIT_M;
+  function startWatchingPosition() {
+    if (!navigator.geolocation) {
+      setGpsStatus("❌ Geolocation not supported.");
+      return;
+    }
+
+    watchId = navigator.geolocation.watchPosition(
+      (position) => {
+        // Update watched position if it's accurate enough
+        if (isGoodFix(position)) {
+          watchedPosition = position;
+        } else {
+          // Clear position if accuracy degrades
+          watchedPosition = null;
+        }
+      },
+      (error) => {
+        const code = error && typeof error.code === "number" ? error.code : null;
+        if (code === 1) { // PERMISSION_DENIED
+          setGpsStatus("GPS: ❌ permission denied. Enable location access in browser settings.");
+        } else {
+          setGpsStatus(`GPS: ${error.message || error}`);
+        }
+        watchedPosition = null;
+      },
+      {
+        enableHighAccuracy: HIGH_ACCURACY,
+        maximumAge: 0, // Don't use cached positions - always get fresh
+        timeout: GEO_TIMEOUT_MS
+      }
+    );
   }
 
   async function warmupLoop() {
     const start = Date.now();
-    setGpsStatus("GPS warm-up: requesting location… (needs HTTPS + permission)");
+    setGpsStatus("GPS warm-up: watching location... (needs HTTPS + permission)");
+    
+    // Wait for first good position from watch
     while (true) {
       try {
         const pos = await getPositionOnce();
-        bestFix = { pos, receivedAtMs: Date.now() };
 
         const acc = Math.round(pos.coords.accuracy);
         if (acc <= ACCURACY_LIMIT_M) {
@@ -124,38 +194,37 @@
         } else {
           const elapsed = Date.now() - start;
           const msg = elapsed > WARMUP_BADFIX_MAX_MS
-            ? `GPS warm-up: fix still weak (${acc}m). Try moving outdoors / enabling GPS. Retrying…`
-            : `GPS warm-up: got fix (${acc}m), need ≤ ${ACCURACY_LIMIT_M}m. Retrying…`;
+            ? `GPS warm-up: fix still weak (${acc}m). Try moving outdoors / enabling GPS. Waiting for better fix...`
+            : `GPS warm-up: got fix (${acc}m), need ≤ ${ACCURACY_LIMIT_M}m. Waiting for better fix...`;
           setGpsStatus(msg);
         }
       } catch (err) {
-        // Common: timeout or permission issues
-        const code = err && typeof err.code === "number" ? err.code : null;
-        if (code === 1) { // PERMISSION_DENIED
-          setGpsStatus("GPS warm-up: ❌ permission denied. Enable location access in browser settings.");
-          return; // cannot retry meaningfully
+        const elapsed = Date.now() - start;
+        if (elapsed > WARMUP_BADFIX_MAX_MS) {
+          setGpsStatus(`GPS warm-up: still waiting for fix. Try moving outdoors / enabling GPS.`);
+        } else {
+          setGpsStatus(`GPS warm-up: ${err.message || err} (waiting…)`);
         }
-        setGpsStatus(`GPS warm-up: ${err.message || err} (retrying…)`);
       }
 
       await sleep(WARMUP_RETRY_MS);
     }
   }
 
-  // Use warm-up fix if it is recent and good, else request fresh.
+  // Get a fresh position - ensures each call gets a new position, not a cached one
   async function getGoodPositionOrThrow() {
-    const now = Date.now();
-    if (bestFix && isGoodFix(bestFix.pos) && (now - bestFix.receivedAtMs) < 15000) {
-      return bestFix.pos;
-    }
-
+    // Wait for a fresh position from the watch
     const pos = await getPositionOnce();
-    bestFix = { pos, receivedAtMs: Date.now() };
+    
+    // Mark this timestamp so we don't reuse the same position next time
+    lastPositionTimestamp = pos.timestamp;
 
     const acc = pos.coords.accuracy;
     if (acc > ACCURACY_LIMIT_M) {
       throw new Error(`Accuracy too low: ${Math.round(acc)}m (> ${ACCURACY_LIMIT_M}m)`);
     }
+    
+    // Return the position directly
     return pos;
   }
 
@@ -168,8 +237,9 @@
     setStatus(`Capturing ${category}: point 1…`);
 
     try {
-      // point 1 (use warm-up fix if good/recent)
+      // point 1
       const p1 = await getGoodPositionOrThrow();
+      const t1 = p1.timestamp;
 
       setStatus(`Capturing ${category}: point 2 in 2s…`);
       await sleep(SAMPLE_GAP_MS);
@@ -190,7 +260,7 @@
         point2: {
           lat: p2.coords.latitude, lon: p2.coords.longitude,
           accuracyM: p2.coords.accuracy, timestampMs: t2
-                }
+        }
       };
 
       queue.push(item);
@@ -224,24 +294,24 @@
     console.log("BATCH_PAYLOAD", batch);
     // Send to backend (save.php)
     fetch("save.php", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(batch)
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(batch)
     })
-    .then(async (res) => {
+      .then(async (res) => {
         const text = await res.text();
         let json = {};
-        try { json = JSON.parse(text); } catch {}
+        try { json = JSON.parse(text); } catch { }
         if (!res.ok) throw new Error(`HTTP ${res.status}: ${text}`);
         console.log("Backend response:", json);
         setDebug({ batch, backendResponse: json });
         setStatus(`✅ Sent batch (${batch.count}). Inserted: ${json.inserted ?? "?"}`);
-    })
-    .catch((err) => {
+      })
+      .catch((err) => {
         console.error(err);
         setDebug({ batch, error: String(err) });
         setStatus(`❌ Send failed: ${err.message || err}`);
-    });
+      });
 
     setDebug(batch);
     setStatus(`📦 Batch printed to console (${batch.count} items).`);
@@ -250,8 +320,10 @@
 
   // ===== STARTUP =====
   updateQueueUI();
-  setStatus("Loading… requesting GPS immediately.");
-  // Start warm-up ASAP
+  setStatus("Loading... starting GPS watch.");
+  // Start watching position immediately
+  startWatchingPosition();
+  // Start warm-up to wait for first good fix
   warmupLoop().catch(err => {
     console.error(err);
     setGpsStatus(`GPS warm-up failed: ${err.message || err}`);
