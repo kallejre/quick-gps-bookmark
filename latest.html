@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Latest GPS Points</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 16px; }
+    .meta { margin: 8px 0 14px; color: #444; }
+    .loading { color: #666; font-style: italic; }
+    .error { color: #c00; }
+    table { border-collapse: collapse; width: 100%; font-size: 14px; }
+    th, td { border: 1px solid #ddd; padding: 8px; vertical-align: top; }
+    th { position: sticky; top: 0; background: #f6f6f6; }
+    tr:nth-child(even) { background: #fafafa; }
+    code { font-size: 12px; }
+    .small { font-size: 12px; color: #555; }
+  </style>
+</head>
+<body>
+  <h2>Latest GPS Points</h2>
+  <div class="meta" id="meta">
+    <span class="loading">Loading...</span>
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>ID</th>
+        <th>Category</th>
+        <th>User</th>
+        <th>Captured</th>
+        <th>Received</th>
+        <th>P1 (lat,lon) acc</th>
+        <th>P2 (lat,lon) acc</th>
+        <th>dt (s)</th>
+        <th>dist (m)</th>
+        <th>speed (km/h)</th>
+        <th>dir (deg)</th>
+        <th class="small">Batch</th>
+      </tr>
+    </thead>
+    <tbody id="tbody">
+      <tr><td colspan="12" class="loading">Loading data...</td></tr>
+    </tbody>
+  </table>
+
+<script>
+  function h(s) {
+    if (s === null || s === undefined) return '';
+    const div = document.createElement('div');
+    div.textContent = s;
+    return div.innerHTML;
+  }
+
+  function formatNumber(num, decimals = 2) {
+    if (num === null || num === undefined) return '';
+    return Number(num).toFixed(decimals);
+  }
+
+  function formatInt(num) {
+    if (num === null || num === undefined) return '';
+    return Math.round(Number(num));
+  }
+
+  // Get limit from URL parameter
+  const urlParams = new URLSearchParams(window.location.search);
+  const limit = urlParams.get('limit') ? Math.max(1, Math.min(500, parseInt(urlParams.get('limit')))) : 50;
+
+  // Fetch data from latest-json.php
+  fetch(`latest-json.php?limit=${limit}`)
+    .then(res => {
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res.json();
+    })
+    .then(data => {
+      if (data.error) {
+        throw new Error(data.error + (data.detail ? ': ' + data.detail : ''));
+      }
+
+      // Update meta info
+      const metaEl = document.getElementById('meta');
+      metaEl.innerHTML = `
+        Showing latest <b>${data.limit}</b> of <b>${data.total}</b> total.
+        &nbsp;|&nbsp; Try <code>?limit=100</code>
+        &nbsp;|&nbsp; <a href="map.html" target="_blank">View on Map</a>
+      `;
+
+
+      // Update table
+      const tbody = document.getElementById('tbody');
+      if (data.rows.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="12">No rows yet.</td></tr>';
+        return;
+      }
+
+      tbody.innerHTML = data.rows.map(r => {
+        const p1Acc = r.p1_accuracy_m !== null ? formatInt(r.p1_accuracy_m) : '';
+        const p2Acc = r.p2_accuracy_m !== null ? formatInt(r.p2_accuracy_m) : '';
+        
+        return `
+          <tr>
+            <td>${formatInt(r.id)}</td>
+            <td>${h(r.category)}</td>
+            <td>${h(r.user || '')}</td>
+            <td>${h(r.captured_at)}</td>
+            <td>${h(r.received_at)}</td>
+            <td>
+              ${formatNumber(r.p1_lat, 6)}, ${formatNumber(r.p1_lon, 6)}
+              <div class="small">acc: ${h(p1Acc)}m</div>
+            </td>
+            <td>
+              ${formatNumber(r.p2_lat, 6)}, ${formatNumber(r.p2_lon, 6)}
+              <div class="small">acc: ${h(p2Acc)}m</div>
+            </td>
+            <td>${h(r.dt_sec !== null ? formatNumber(r.dt_sec, 2) : '')}</td>
+            <td>${h(r.distance_m !== null ? formatNumber(r.distance_m, 2) : '')}</td>
+            <td>${h(r.speed_kmh !== null ? formatNumber(r.speed_kmh, 2) : '')}</td>
+            <td>${h(r.direction_deg !== null ? formatNumber(r.direction_deg, 1) : '')}</td>
+            <td class="small">
+              <div>sent: ${h(r.sent_at || '')}</div>
+              <div>reason: ${h(r.reason || '')}</div>
+            </td>
+          </tr>
+        `;
+      }).join('');
+    })
+    .catch(err => {
+      const metaEl = document.getElementById('meta');
+      metaEl.innerHTML = `<span class="error">Error: ${h(err.message)}</span>`;
+      const tbody = document.getElementById('tbody');
+      tbody.innerHTML = `<tr><td colspan="12" class="error">Failed to load data: ${h(err.message)}</td></tr>`;
+    });
+</script>
+</body>
+</html>

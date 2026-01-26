@@ -1,0 +1,100 @@
+<!doctype html>
+<html>
+
+<head>
+  <meta charset="utf-8">
+  <title>GPS Map</title>
+
+  <!-- Leaflet CSS/JS -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <!-- MarkerCluster CSS/JS -->
+  <link rel="stylesheet" href="https://leaflet.github.io/Leaflet.markercluster/dist/MarkerCluster.css" />
+  <link rel="stylesheet" href="https://leaflet.github.io/Leaflet.markercluster/dist/MarkerCluster.Default.css" />
+  <script src="https://leaflet.github.io/Leaflet.markercluster/dist/leaflet.markercluster-src.js"></script>
+
+  <style>
+    #map {
+      height: 100vh;
+      width: 100%;
+    }
+
+    body {
+      margin: 0px;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="map"></div>
+
+  <script>
+    // Create map
+    const map = L.map('map', {
+      maxZoom: 20 // Increasing beyond 19 clears tiles, not upscales them
+    }
+    ).setView([0, 0], 2);
+
+    // Add OSM tiles
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '&copy; OpenStreetMap contributors',
+      maxNativeZoom: 18,
+      maxZoom: 20
+    }).addTo(map);
+
+    // Create MarkerClusterGroup
+    const markers = L.markerClusterGroup({
+      showCoverageOnHover: true,
+      spiderfyOnMaxZoom: true,
+      zoomToBoundsOnClick: true,
+      maxClusterRadius: 50,
+      singleMarkerMode: false,
+      //disableClusteringAtZoom:18
+    });
+
+    // Fetch JSON from latest-json.php
+    fetch('latest-json.php?limit=2500')
+      .then(res => res.json())
+      .then(data => {
+        // Use new JSON structure: data.rows, each with p1_lat, p1_lon, etc.
+        data.rows.forEach(pt => {
+          // Use p1_lat and p1_lon as marker point (primary coordinate)
+          if (typeof pt.p1_lat === "number" && typeof pt.p1_lon === "number") {
+            const icon = L.divIcon({
+              html: `<div style="transform: rotate(${pt.direction_deg - 180}deg);">
+                      💎
+                    </div>`,
+              className: '',
+              iconSize: [20, 20]
+            });
+            const marker = L.marker([pt.p1_lat, pt.p1_lon], { icon });
+
+            // Optional popup with all main info
+            marker.bindPopup(`
+              <b>ID:</b> ${pt.id}<br>
+              <b>Cat:</b> ${pt.category}<br>
+              <b>User:</b> ${pt.user || ''}<br>
+              <b>Captured:</b> ${pt.captured_at || ''}<br>
+              <b>Acc:</b> ${pt.p1_accuracy_m !== null ? Math.round(pt.p1_accuracy_m) + " m" : ""}<br>
+              <b>Speed:</b> ${pt.speed_kmh !== null ? pt.speed_kmh.toFixed(2) + " km/h" : ""}<br>
+              <b>Dir:</b> ${pt.direction_deg !== null ? pt.direction_deg.toFixed(0) + "&deg;" : ""}<br>
+              <b>Pos:</b> ${pt.p1_lat !== null ? pt.p1_lat.toFixed(5) + ", " + pt.p1_lon.toFixed(5) : ""}<br>
+            `);
+
+            markers.addLayer(marker);
+          }
+        });
+
+        map.addLayer(markers);
+
+        // Zoom map to fit all markers
+        const bounds = markers.getBounds();
+        if (bounds.isValid()) map.fitBounds(bounds);
+
+      })
+      .catch(err => console.error('Failed to load points', err));
+  </script>
+</body>
+
+</html>
