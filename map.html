@@ -23,6 +23,10 @@
     body {
       margin: 0px;
     }
+
+    .resolved-note {
+      filter: hue-rotate(-70deg) saturate(180%);
+    }
   </style>
 </head>
 
@@ -53,38 +57,94 @@
       //disableClusteringAtZoom:18
     });
 
+    async function reloadMarkers() {
+      // Keep current view (center+zoom)
+      const center = map.getCenter();
+      const zoom = map.getZoom();
+
+      const r = await fetch('latest-json.php?limit=2500', { cache: 'no-store' });
+      const data = await r.json();
+
+      // Clear all clustered markers
+      markers.clearLayers();
+
+      // Re-add markers from fresh data
+      data.rows.forEach(pt => addMarker(pt));
+
+      // Restore view exactly
+      map.setView(center, zoom, { animate: false });
+    }
+
+    // Function to hide a point (mark as resolved or deleted)
+    async function hidePoint(id, reason) {
+      await fetch('hide.php', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id, hide: 1, reason })
+      });
+      // then refresh markers (simplest: reload page)
+      await reloadMarkers();
+      map.closePopup();
+    };
+
+
+    function addMarker(pt) {
+      if (typeof pt.p1_lat !== "number" || typeof pt.p1_lon !== "number") return;
+
+      // Safe rotation
+      const rot = (typeof pt.direction_deg === 'number') ? (pt.direction_deg - 180) : 0;
+
+      let iconEmoji = '💎';
+      switch (pt.category) {
+        case 'BENCH': iconEmoji = '🪑'; break;
+        case 'BIN': iconEmoji = '🗑️'; break;
+        case 'TABLE':
+          //Traffic table
+          iconEmoji = '🚥'; break;
+        case 'TREE':
+          iconEmoji = '🌳';
+          iconEmoji = '💎';
+          break;
+        case 'CAM':
+          iconEmoji = '📹';
+          iconEmoji = '💎';
+          break;
+        default: iconEmoji = '💎'; break
+      }
+
+      const icon = L.divIcon({
+        html: `<div style="transform: rotate(${rot}deg);" class="${pt.hidden_reason ? 'resolved-note' : ''}">
+            ${iconEmoji}
+          </div>`,
+        className: '',
+        iconSize: [20, 20]
+      });
+
+      const marker = L.marker([pt.p1_lat, pt.p1_lon], { icon });
+
+      marker.bindPopup(`
+    <b>ID:</b> ${pt.id}<br>
+    <b>Cat:</b> ${pt.category}<br>
+    <b>User:</b> ${pt.user || ''}<br>
+    <b>Captured:</b> ${pt.captured_at || ''}<br>
+    <b>Acc:</b> ${pt.p1_accuracy_m !== null ? Math.round(pt.p1_accuracy_m) + " m" : ""}<br>
+    <b>Speed:</b> ${pt.speed_kmh !== null ? pt.speed_kmh.toFixed(2) + " km/h" : ""}<br>
+    <b>Dir:</b> ${pt.direction_deg !== null ? pt.direction_deg.toFixed(0) + "&deg;" : ""}<br>
+    <b>Pos:</b> ${pt.p1_lat !== null ? pt.p1_lat.toFixed(5) + ", " + pt.p1_lon.toFixed(5) : ""}<br>
+    ${pt.hidden_at ? `<b>Resolved</b>: ${pt.hidden_reason}` : `
+      <button class="popupbtn resolve" onclick="hidePoint(${pt.id}, 'resolved')">✅</button>
+      <button class="popupbtn delete" onclick="hidePoint(${pt.id}, 'deleted')">🗑️</button>
+    `}
+  `);
+
+      markers.addLayer(marker);
+    }
+
     // Fetch JSON from latest-json.php
     fetch('latest-json.php?limit=2500')
       .then(res => res.json())
       .then(data => {
-        // Use new JSON structure: data.rows, each with p1_lat, p1_lon, etc.
-        data.rows.forEach(pt => {
-          // Use p1_lat and p1_lon as marker point (primary coordinate)
-          if (typeof pt.p1_lat === "number" && typeof pt.p1_lon === "number") {
-            const icon = L.divIcon({
-              html: `<div style="transform: rotate(${pt.direction_deg - 180}deg);">
-                      💎
-                    </div>`,
-              className: '',
-              iconSize: [20, 20]
-            });
-            const marker = L.marker([pt.p1_lat, pt.p1_lon], { icon });
-
-            // Optional popup with all main info
-            marker.bindPopup(`
-              <b>ID:</b> ${pt.id}<br>
-              <b>Cat:</b> ${pt.category}<br>
-              <b>User:</b> ${pt.user || ''}<br>
-              <b>Captured:</b> ${pt.captured_at || ''}<br>
-              <b>Acc:</b> ${pt.p1_accuracy_m !== null ? Math.round(pt.p1_accuracy_m) + " m" : ""}<br>
-              <b>Speed:</b> ${pt.speed_kmh !== null ? pt.speed_kmh.toFixed(2) + " km/h" : ""}<br>
-              <b>Dir:</b> ${pt.direction_deg !== null ? pt.direction_deg.toFixed(0) + "&deg;" : ""}<br>
-              <b>Pos:</b> ${pt.p1_lat !== null ? pt.p1_lat.toFixed(5) + ", " + pt.p1_lon.toFixed(5) : ""}<br>
-            `);
-
-            markers.addLayer(marker);
-          }
-        });
+        data.rows.forEach(pt => addMarker(pt));
 
         map.addLayer(markers);
 

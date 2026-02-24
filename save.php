@@ -100,6 +100,9 @@ $pdo->exec("
     speed_kmh REAL,
     direction_deg REAL,
 
+    hidden_reason TEXT NULL, -- For handling deletions
+    hidden_at TEXT NULL,
+
     raw_json TEXT                  -- full original item for debugging/future-proofing
   );
 ");

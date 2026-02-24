@@ -28,8 +28,10 @@ $stmt = $pdo->prepare("
     category, user, captured_at,
     p1_lat, p1_lon, p1_accuracy_m, p1_timestamp_ms,
     p2_lat, p2_lon, p2_accuracy_m, p2_timestamp_ms,
-    dt_sec, distance_m, speed_kmh, direction_deg
+    dt_sec, distance_m, speed_kmh, IFNULL(direction_deg,0) AS direction_deg,
+    hidden_reason, hidden_at
   FROM gps_points
+  WHERE hidden_at IS NULL OR hidden_at >= datetime('now', '-7 day')
   ORDER BY id DESC
   LIMIT :limit
 ");

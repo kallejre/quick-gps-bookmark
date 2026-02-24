@@ -18,7 +18,7 @@ Known bugs todos:
 * Support for icons for buttons
 * ~~Calculated columns dt, speed, distance, direction are shown 0.0 in data view~~ - Was GPS bug
 * Locking phone screen loses gps fix, unless user has other gps running at same time
-* Browser can't force system  to reload gps position, only way to make page usable is to have GPS tracking app open in background
+* ⚠️⚠️⚠️ Browser can't force system  to reload gps position, only way to make page usable is to have GPS tracking app open in background
 * ~~Map to see notes~~
   * Due to using 💎 emoji as direction marker, Android 7 and earlier will render direction 45deg to right.
-* Needs ability to mark notes as resolved
+* ~~Needs ability to mark notes as resolved~~
